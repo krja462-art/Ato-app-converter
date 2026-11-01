@@ -1,0 +1,133 @@
+name: Automated Android APK & AAB Builder
+
+on:
+  repository_dispatch:
+    types: [build-android-apk]
+
+env:
+  JAVA_VERSION: '17'
+  ANDROID_COMPILE_SDK: '34'
+  ANDROID_BUILD_TOOLS: '34.0.0'
+
+jobs:
+  compile-android-release:
+    name: Inject Config & Build Signed APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Android WebView Template Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Setup Android SDK CLI Tools
+        uses: android-actions/setup-android@v3
+
+      - name: Notify Backend Webhook (BUILDING Stage)
+        run: |
+          curl -sS -X POST "${{ github.event.client_payload.webhook_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SHARED_SECRET }}" \
+            -d '{
+              "build_id": "${{ github.event.client_payload.build_id }}",
+              "github_run_id": "${{ github.run_id }}",
+              "status": "BUILDING",
+              "stage": "Injecting Android Manifest, Package ID & WebView Config",
+              "progress": 38
+            }' || true
+
+      - name: Dynamically Inject App Parameters (sed / xmlstarlet / ImageMagick)
+        env:
+          APP_NAME: ${{ github.event.client_payload.app_name }}
+          PACKAGE_NAME: ${{ github.event.client_payload.package_name }}
+          TARGET_URL: ${{ github.event.client_payload.target_url }}
+          PRIMARY_COLOR: ${{ github.event.client_payload.primary_color }}
+          STATUS_BAR_COLOR: ${{ github.event.client_payload.status_bar_color }}
+          SPLASH_COLOR: ${{ github.event.client_payload.splash_color }}
+          SWIPE_REFRESH: ${{ github.event.client_payload.swipe_to_refresh }}
+          FILE_UPLOAD: ${{ github.event.client_payload.native_file_upload }}
+          GEOLOCATION: ${{ github.event.client_payload.geolocation }}
+          PUSH_ENABLED: ${{ github.event.client_payload.push_notifications }}
+          ONESIGNAL_APP_ID: ${{ github.event.client_payload.onesignal_app_id }}
+          OFFLINE_FALLBACK: ${{ github.event.client_payload.offline_fallback }}
+          VERSION_NAME: ${{ github.event.client_payload.version_name }}
+          VERSION_CODE: ${{ github.event.client_payload.version_code }}
+          ICON_URL: ${{ github.event.client_payload.app_icon_url }}
+        run: |
+          set -euo pipefail
+          echo "==> Injecting configuration for $APP_NAME ($PACKAGE_NAME)"
+
+          sed -i "s|applicationId = \".*\"|applicationId = \"$PACKAGE_NAME\"|g" app/build.gradle.kts
+          sed -i "s|versionCode = [0-9]*|versionCode = $VERSION_CODE|g" app/build.gradle.kts
+          sed -i "s|versionName = \".*\"|versionName = \"$VERSION_NAME\"|g" app/build.gradle.kts
+
+          ESCAPED_NAME=$(printf '%s\n' "$APP_NAME" | sed -e 's/[\/&]/\\&/g')
+          sed -i "s|<string name=\"app_name\">.*</string>|<string name=\"app_name\">$ESCAPED_NAME</string>|g" app/src/main/res/values/strings.xml
+          sed -i "s|<string name=\"target_url\">.*</string>|<string name=\"target_url\">$TARGET_URL</string>|g" app/src/main/res/values/strings.xml
+
+          sed -i "s|<color name=\"colorPrimary\">.*</color>|<color name=\"colorPrimary\">$PRIMARY_COLOR</color>|g" app/src/main/res/values/colors.xml
+          sed -i "s|<color name=\"colorPrimaryDark\">.*</color>|<color name=\"colorPrimaryDark\">$STATUS_BAR_COLOR</color>|g" app/src/main/res/values/colors.xml
+          sed -i "s|<color name=\"splashBackground\">.*</color>|<color name=\"splashBackground\">$SPLASH_COLOR</color>|g" app/src/main/res/values/colors.xml
+
+          mkdir -p app/src/main/assets
+          cat <<EOF > app/src/main/assets/app_config.json
+          {
+            "appName": "$APP_NAME",
+            "packageName": "$PACKAGE_NAME",
+            "targetUrl": "$TARGET_URL",
+            "primaryColor": "$PRIMARY_COLOR",
+            "swipeToRefresh": $SWIPE_REFRESH,
+            "nativeFileUpload": $FILE_UPLOAD,
+            "geolocation": $GEOLOCATION,
+            "pushNotifications": $PUSH_ENABLED,
+            "oneSignalAppId": "$ONESIGNAL_APP_ID",
+            "offlineFallback": $OFFLINE_FALLBACK
+          }
+          EOF
+
+      - name: Compile Signed Release APK & Play Store AAB with Gradle
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease bundleRelease --no-daemon --stacktrace
+
+      - name: Upload Compiled Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk-${{ github.event.client_payload.build_id }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+      - name: Upload Play Store Bundle (AAB) Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aab-${{ github.event.client_payload.build_id }}
+          path: app/build/outputs/bundle/release/*.aab
+          retention-days: 30
+
+      - name: Notify SaaS Backend Webhook on Completion
+        if: always()
+        run: |
+          FINAL_STATUS="COMPLETED"
+          if [ "${{ job.status }}" != "success" ]; then
+            FINAL_STATUS="FAILED"
+          fi
+          curl -sS -X POST "${{ github.event.client_payload.webhook_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SHARED_SECRET }}" \
+            -d "{
+              \"build_id\": \"${{ github.event.client_payload.build_id }}\",
+              \"github_run_id\": \"${{ github.run_id }}\",
+              \"status\": \"$FINAL_STATUS\",
+              \"stage\": \"Gradle assembleRelease & bundleRelease finished\",
+              \"progress\": 100,
+              \"apk_download_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts\",
+              \"aab_download_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts\"
+            }"

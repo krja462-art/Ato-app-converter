@@ -1,0 +1,6 @@
+{
+  "name": "MedianForge — Web-to-App SaaS & Automated APK Builder",
+  "description": "Enterprise Web-to-App SaaS platform featuring a live interactive Android WebView device studio and an automated GitHub Actions APK/AAB CI/CD build engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
