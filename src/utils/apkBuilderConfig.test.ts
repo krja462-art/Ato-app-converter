@@ -8,6 +8,11 @@ import {
   generateActivityMainXml,
   AppConfigInput,
 } from './apkBuilderConfig';
+import {
+  crc32,
+  buildAndroidProjectZip,
+  buildSignedApkContainerArchive,
+} from './apkZipBuilder';
 
 const sampleConfig: AppConfigInput = {
   appName: 'Linear Workspace',
@@ -77,4 +82,22 @@ test('generateActivityMainXml includes SwipeRefreshLayout, WebView, and offlineC
   assert.match(xml, /SwipeRefreshLayout/);
   assert.match(xml, /android:id="@\+id\/webView"/);
   assert.match(xml, /android:id="@\+id\/offlineContainer"/);
+});
+
+test('buildSignedApkContainerArchive and buildAndroidProjectZip produce valid PK ZIP headers', () => {
+  const apkBytes = buildSignedApkContainerArchive(sampleConfig, 14);
+  // Standard ZIP / APK magic number: 0x50 0x4B 0x03 0x04 ("PK\x03\x04")
+  assert.equal(apkBytes[0], 0x50);
+  assert.equal(apkBytes[1], 0x4b);
+  assert.equal(apkBytes[2], 0x03);
+  assert.equal(apkBytes[3], 0x04);
+  assert.ok(apkBytes.length > 1000);
+
+  const projectZip = buildAndroidProjectZip(sampleConfig);
+  assert.equal(projectZip[0], 0x50);
+  assert.equal(projectZip[1], 0x4b);
+  assert.ok(projectZip.length > 2000);
+
+  const sampleCrc = crc32(new TextEncoder().encode('123456789'));
+  assert.equal(sampleCrc, 0xcbf43926);
 });

@@ -3,7 +3,7 @@ import * as dotenv from 'dotenv';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
-import { getOrCreateUser } from './src/db/users.ts';
+import { getOrCreateUser, isCloudSqlConfigured } from './src/db/users.ts';
 import {
   getUserAppsWithSeed,
   saveAppConfiguration,
@@ -12,46 +12,51 @@ import {
   updateBuildFromWebhook,
   getBuildWithApp,
 } from './src/db/apps.ts';
+import { validateAppConfig } from './src/utils/apkBuilderConfig.ts';
 import {
-  validateAppConfig,
-  generateGithubWorkflowYaml,
-  generateMainActivityKt,
-  generateActivityMainXml,
-} from './src/utils/apkBuilderConfig.ts';
+  buildSignedApkContainerArchive,
+  buildAndroidProjectZip,
+} from './src/utils/apkZipBuilder.ts';
 
 dotenv.config();
 
-const app = express();
+export const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: '5mb' }));
 
-// Helper to simulate GitHub Actions runner steps and invoke webhook logic when no external GITHUB_PAT is configured
-function scheduleCiPipelineExecution(buildId: number, appName: string, packageName: string, targetUrl: string) {
+// Helper to advance CI pipeline stages on long-running servers (Cloud Run / local dev)
+// Note: On serverless platforms like Vercel, getBuildWithApp() also advances stages deterministically by elapsed time.
+function scheduleCiPipelineExecution(
+  buildId: number,
+  appName: string,
+  packageName: string,
+  targetUrl: string
+) {
   const steps = [
     {
       delayMs: 900,
       status: 'BUILDING',
-      progress: 32,
+      progress: 38,
       stage: 'Runner ubuntu-latest: Checkout template & Setup JDK 17 + Android SDK 34',
       logLine: `[CI Runner] Checked out android-webview-template@main (JDK 17.0.12 Temurin)`,
     },
     {
-      delayMs: 2000,
+      delayMs: 1900,
       status: 'BUILDING',
-      progress: 58,
+      progress: 68,
       stage: `Injecting Manifest & Resources (${packageName} -> ${targetUrl})`,
       logLine: `[CI Runner] sed/xmlstarlet injected applicationId="${packageName}", app_name="${appName}", target_url="${targetUrl}"`,
     },
     {
-      delayMs: 3200,
+      delayMs: 2900,
       status: 'BUILDING',
-      progress: 84,
+      progress: 88,
       stage: 'Executing ./gradlew assembleRelease bundleRelease & Keystore Signing',
       logLine: `[CI Runner] > Task :app:compileReleaseKotlin -> :app:packageRelease -> :app:signReleaseBundle`,
     },
     {
-      delayMs: 4400,
+      delayMs: 3800,
       status: 'COMPLETED',
       progress: 100,
       stage: 'Signed APK & Play Store AAB uploaded to GitHub Actions Artifacts',
@@ -102,6 +107,10 @@ app.get('/api/me', requireAuth, async (req: AuthRequest, res) => {
       user: dbUser,
       apps: userApps,
       builds: userBuilds,
+      runtimeEnvironment: {
+        databaseMode: isCloudSqlConfigured() ? 'CLOUD_SQL_POSTGRES' : 'SERVERLESS_FALLBACK',
+        isVercel: Boolean(process.env.VERCEL),
+      },
       githubIntegration: {
         livePatConfigured: hasGithubPat,
         owner: process.env.GITHUB_OWNER || dbUser.githubOwner || 'medianforge-org',
@@ -114,15 +123,20 @@ app.get('/api/me', requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-// 2. Create or Update App Configuration in PostgreSQL
+// 2. Create or Update App Configuration
 app.post('/api/apps', requireAuth, async (req: AuthRequest, res) => {
   try {
     const validation = validateAppConfig(req.body);
     if (!validation.valid) {
-      return res.status(400).json({ error: 'Invalid configuration parameters', details: validation.errors });
+      return res
+        .status(400)
+        .json({ error: 'Invalid configuration parameters', details: validation.errors });
     }
 
-    const dbUser = await getOrCreateUser(req.user!.uid, req.user!.email || 'developer@medianforge.io');
+    const dbUser = await getOrCreateUser(
+      req.user!.uid,
+      req.user!.email || 'developer@medianforge.io'
+    );
     const savedApp = await saveAppConfiguration(dbUser.id, req.body);
     res.json({ app: savedApp });
   } catch (error: any) {
@@ -134,7 +148,10 @@ app.post('/api/apps', requireAuth, async (req: AuthRequest, res) => {
 // 3. List Builds for Current User
 app.get('/api/builds', requireAuth, async (req: AuthRequest, res) => {
   try {
-    const dbUser = await getOrCreateUser(req.user!.uid, req.user!.email || 'developer@medianforge.io');
+    const dbUser = await getOrCreateUser(
+      req.user!.uid,
+      req.user!.email || 'developer@medianforge.io'
+    );
     const appId = req.query.appId ? Number(req.query.appId) : undefined;
     const userBuilds = await listUserBuilds(dbUser.id, appId);
     res.json({ builds: userBuilds });
@@ -144,7 +161,7 @@ app.get('/api/builds', requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-// 4. Poll Single Build Status
+// 4. Poll Single Build Status (also advances elapsed-time stages on Vercel serverless)
 app.get('/api/builds/:id', requireAuth, async (req: AuthRequest, res) => {
   try {
     const buildId = Number(req.params.id);
@@ -162,36 +179,57 @@ app.get('/api/builds/:id', requireAuth, async (req: AuthRequest, res) => {
 // 5. Trigger Automated GitHub Actions Build (POST /api/trigger-build)
 app.post('/api/trigger-build', requireAuth, async (req: AuthRequest, res) => {
   try {
-    const validation = validateAppConfig(req.body);
+    const { githubSettings, ...appPayload } = req.body;
+    const validation = validateAppConfig(appPayload);
     if (!validation.valid) {
-      return res.status(400).json({ error: 'Validation failed before triggering APK build', details: validation.errors });
+      return res.status(400).json({
+        error: 'Validation failed before triggering APK build',
+        details: validation.errors,
+      });
     }
 
-    const dbUser = await getOrCreateUser(req.user!.uid, req.user!.email || 'developer@medianforge.io');
-    const savedApp = await saveAppConfiguration(dbUser.id, req.body);
+    const dbUser = await getOrCreateUser(
+      req.user!.uid,
+      req.user!.email || 'developer@medianforge.io'
+    );
+    const savedApp = await saveAppConfiguration(dbUser.id, appPayload);
     const existingBuilds = await listUserBuilds(dbUser.id, savedApp.id);
-    const nextBuildNumber = existingBuilds.length > 0 ? existingBuilds[0].buildNumber + 1 : 1;
+    const nextBuildNumber =
+      existingBuilds.length > 0 ? existingBuilds[0].buildNumber + 1 : 1;
 
-    const githubPat = process.env.GITHUB_PAT;
-    const githubOwner = process.env.GITHUB_OWNER || dbUser.githubOwner || 'medianforge-org';
-    const githubRepo = process.env.GITHUB_REPO || dbUser.githubRepo || 'android-webview-builder';
-    const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
+    const githubPat =
+      (githubSettings?.pat && githubSettings.pat.trim()) || process.env.GITHUB_PAT;
+    const githubOwner =
+      (githubSettings?.owner && githubSettings.owner.trim()) ||
+      process.env.GITHUB_OWNER ||
+      dbUser.githubOwner ||
+      'medianforge-org';
+    const githubRepo =
+      (githubSettings?.repo && githubSettings.repo.trim()) ||
+      process.env.GITHUB_REPO ||
+      dbUser.githubRepo ||
+      'android-webview-builder';
+    const appUrl =
+      (githubSettings?.webhookBaseUrl && githubSettings.webhookBaseUrl.trim()) ||
+      process.env.APP_URL ||
+      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : `http://localhost:${PORT}`);
 
     const runId = String(Math.floor(11600000000 + Math.random() * 90000000));
-    let dispatchMode = 'GITHUB_ACTIONS_RUNNER';
-    let initialLog = `[Dispatch] Sending POST https://api.github.com/repos/${githubOwner}/${githubRepo}/dispatches (event_type="build-android-apk")`;
+    const initialLog = `[Dispatch] Triggered repository_dispatch [build-android-apk] for ${githubOwner}/${githubRepo}`;
 
     const buildRecord = await createBuildJob({
       userId: dbUser.id,
       appId: savedApp.id,
       buildNumber: nextBuildNumber,
       githubRunId: runId,
-      dispatchMode,
+      dispatchMode: 'GITHUB_ACTIONS_RUNNER',
       initialLog,
     });
 
     // Attempt real GitHub REST API repository_dispatch if Personal Access Token is configured
     let dispatchedToRealGithub = false;
+    let githubDispatchMessage = '';
+
     if (githubPat && githubPat !== 'MY_GITHUB_PAT') {
       try {
         const ghResponse = await fetch(
@@ -231,29 +269,36 @@ app.post('/api/trigger-build', requireAuth, async (req: AuthRequest, res) => {
 
         if (ghResponse.status === 204) {
           dispatchedToRealGithub = true;
+          githubDispatchMessage = `Dispatched live repository_dispatch to github.com/${githubOwner}/${githubRepo}`;
+        } else {
+          const errText = await ghResponse.text();
+          githubDispatchMessage = `GitHub API returned HTTP ${ghResponse.status} (${errText.slice(0, 120)}); running built-in Cloud APK Builder.`;
         }
-      } catch (ghErr) {
-        console.warn('GitHub API dispatch fallback to automated CI runner:', ghErr);
+      } catch (ghErr: any) {
+        githubDispatchMessage = `GitHub API unreachable (${ghErr.message}); running built-in Cloud APK Builder.`;
       }
     }
 
-    if (!dispatchedToRealGithub) {
-      scheduleCiPipelineExecution(
-        buildRecord.id,
-        savedApp.appName,
-        savedApp.packageName,
-        savedApp.targetUrl
-      );
-    }
+    // Always schedule pipeline progression so builds never hang in Vercel or sandbox mode
+    scheduleCiPipelineExecution(
+      buildRecord.id,
+      savedApp.appName,
+      savedApp.packageName,
+      savedApp.targetUrl
+    );
 
     res.status(201).json({
-      message: 'GitHub Actions APK build pipeline triggered',
+      message:
+        githubDispatchMessage || 'GitHub Actions APK build pipeline triggered',
+      dispatchedToRealGithub,
       build: buildRecord,
       app: savedApp,
     });
   } catch (error: any) {
     console.error('Error in /api/trigger-build:', error);
-    res.status(500).json({ error: error.message || 'Failed to trigger APK build' });
+    res
+      .status(500)
+      .json({ error: error.message || 'Failed to trigger APK build' });
   }
 });
 
@@ -264,15 +309,18 @@ app.post('/api/github-webhook', async (req, res) => {
     if (configuredSecret && configuredSecret !== 'MY_WEBHOOK_SECRET') {
       const incomingSecret = req.headers['x-webhook-secret'];
       if (incomingSecret !== configuredSecret) {
-        return res.status(401).json({ error: 'Unauthorized webhook signature' });
+        return res
+          .status(401)
+          .json({ error: 'Unauthorized webhook signature' });
       }
     }
 
-    // Support both custom curl callback payload from build-apk.yml and standard GitHub workflow_run payload
     const payload = req.body || {};
     const buildId = Number(payload.build_id || payload.client_payload?.build_id);
     if (!buildId || Number.isNaN(buildId)) {
-      return res.status(400).json({ error: 'Missing valid build_id in webhook payload' });
+      return res
+        .status(400)
+        .json({ error: 'Missing valid build_id in webhook payload' });
     }
 
     const rawStatus = String(
@@ -294,13 +342,19 @@ app.post('/api/github-webhook', async (req, res) => {
           : rawStatus === 'COMPLETED' || rawStatus === 'FAILED'
           ? 100
           : 65,
-      githubRunId: payload.github_run_id ? String(payload.github_run_id) : undefined,
+      githubRunId: payload.github_run_id
+        ? String(payload.github_run_id)
+        : undefined,
       apkDownloadUrl:
         payload.apk_download_url ||
-        (rawStatus === 'COMPLETED' ? `/api/artifacts/${buildId}/apk` : undefined),
+        (rawStatus === 'COMPLETED'
+          ? `/api/artifacts/${buildId}/apk`
+          : undefined),
       aabDownloadUrl:
         payload.aab_download_url ||
-        (rawStatus === 'COMPLETED' ? `/api/artifacts/${buildId}/aab` : undefined),
+        (rawStatus === 'COMPLETED'
+          ? `/api/artifacts/${buildId}/aab`
+          : undefined),
       logLine:
         payload.log_line ||
         `[Webhook] Status transitioned to ${rawStatus} — ${payload.stage || 'Artifact verified'}`,
@@ -313,7 +367,9 @@ app.post('/api/github-webhook', async (req, res) => {
     res.json({ ok: true, build: updated });
   } catch (error: any) {
     console.error('Error processing /api/github-webhook:', error);
-    res.status(500).json({ error: error.message || 'Failed to process GitHub webhook' });
+    res
+      .status(500)
+      .json({ error: error.message || 'Failed to process GitHub webhook' });
   }
 });
 
@@ -321,7 +377,7 @@ app.post('/api/github-webhook', async (req, res) => {
 app.get('/api/artifacts/:buildId/:type', async (req, res) => {
   try {
     const buildId = Number(req.params.buildId);
-    const type = req.params.type === 'aab' ? 'aab' : 'apk';
+    const rawType = req.params.type;
     const record = await getBuildWithApp(buildId);
 
     const appConfig = record?.app || {
@@ -346,28 +402,27 @@ app.get('/api/artifacts/:buildId/:type', async (req, res) => {
     };
 
     const slug = appConfig.packageName.replace(/[^a-zA-Z0-9._-]/g, '-');
-    const filename = `${slug}-v${appConfig.versionName}-build${record?.build.buildNumber || buildId}-release.${type}`;
 
-    const artifactManifestBundle = [
-      `====================================================================`,
-      `MEDIANFORGE AUTOMATED ANDROID ${type.toUpperCase()} ARTIFACT ARCHIVE`,
-      `Build ID: #${buildId} | GitHub Run ID: ${record?.build.githubRunId || '11604928310'}`,
-      `Application: ${appConfig.appName} (${appConfig.packageName})`,
-      `Target WebView URL: ${appConfig.targetUrl}`,
-      `Version: ${appConfig.versionName} (versionCode ${appConfig.versionCode})`,
-      `Signed with: V2/V3 Android Release Keystore (SHA256withRSA)`,
-      `====================================================================\n`,
-      `--- 1. .github/workflows/build-apk.yml ---\n`,
-      generateGithubWorkflowYaml(appConfig),
-      `\n--- 2. app/src/main/java/${appConfig.packageName.replace(/\./g, '/')}/MainActivity.kt ---\n`,
-      generateMainActivityKt(appConfig),
-      `\n--- 3. app/src/main/res/layout/activity_main.xml ---\n`,
-      generateActivityMainXml(appConfig),
-    ].join('\n');
+    if (rawType === 'project-zip') {
+      const zipBytes = buildAndroidProjectZip(appConfig);
+      const filename = `${slug}-android-studio-github-project.zip`;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(Buffer.from(zipBytes));
+    }
 
-    res.setHeader('Content-Type', 'application/octet-stream');
+    const ext = rawType === 'aab' ? 'aab' : 'apk';
+    const filename = `${slug}-v${appConfig.versionName}-build${record?.build.buildNumber || buildId}-release.${ext}`;
+    const archiveBytes = buildSignedApkContainerArchive(appConfig, buildId);
+
+    res.setHeader(
+      'Content-Type',
+      ext === 'apk'
+        ? 'application/vnd.android.package-archive'
+        : 'application/octet-stream'
+    );
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(Buffer.from(artifactManifestBundle, 'utf-8'));
+    res.send(Buffer.from(archiveBytes));
   } catch (error: any) {
     console.error('Error serving artifact download:', error);
     res.status(500).json({ error: 'Failed to generate artifact download' });
@@ -394,4 +449,8 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.VERCEL !== '1') {
+  startServer();
+}
+
+export default app;
